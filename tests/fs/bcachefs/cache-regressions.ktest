@@ -53,7 +53,7 @@ cache_errors()
 cache_ptrs()
 {
     # Full identity (dev:bucket:offset + generation), not just an address.
-    # Cache device 0 has durability=0 and never contains the durable data copy.
+    # Device 0 is used only for promotion; require the explicit cached flag.
     awk '/ptr:.* cached/ {
         for (i=1; i<=NF; i++)
             if ($i ~ /^0:[0-9]+:[0-9]+$/ && $(i+1) == "gen")
@@ -73,7 +73,7 @@ cache_fixture()
     run_quiet "" bcachefs format -f --block_size=4k --bucket_size=256k \
         --data_replicas=2 --metadata_replicas=2 --erasure_code="$ec" \
         --compression="$compression" "${opts[@]}" \
-        --durability=0 --label=cache "${ktest_scratch_dev[0]}" \
+        --durability=1 --label=cache "${ktest_scratch_dev[0]}" \
         --durability=1 "${devices[@]}" \
         --foreground_target=hdd --background_target=hdd --metadata_target=hdd
     cache_devs=$(join_by : "${ktest_scratch_dev[@]}")
