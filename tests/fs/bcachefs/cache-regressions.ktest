@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# Cache integrity regressions for bcachefs-tools#1154 and #1155.
+# Only ktest scratch devices are formatted/corrupted. Raw writes happen unmounted.
+
+. "$(dirname "$(readlink -e "${BASH_SOURCE[0]}")")/bcachefs-test-libs.sh"
+
+require-kernel-config BCACHEFS_ERASURE_CODING
+require-kernel-config DYNAMIC_FTRACE
+config-scratch-devs 1G
+for ((i = 0; i < 5; i++)); do config-scratch-devs 2G; done
+
+cache_fail()
+{
+    echo "cache regression: $*" >&2
+    exit 1
+}
+
+cache_sysfs()
+{
+    local uuid
+    uuid=$(bcachefs fs usage /mnt | awk '/^Filesystem:/ {print $2; exit}')
+    cache_sys=/sys/fs/bcachefs/$uuid
+    [[ -r $cache_sys/dev-0/io_errors ]] || cache_fail "missing device error counters"
+    cache_keys=/sys/kernel/debug/bcachefs/$uuid/btrees/extents/keys
+    [[ -r $cache_keys ]] || cache_fail "missing extents debugfs view"
+}
+
+cache_errors()
+{
+    # First section is lifetime; the second is since reset. Do not double count.
+    awk '$1 == "checksum:" { print $2; found=1; exit }
+         END { if (!found) exit 1 }' "$cache_sys/dev-0/io_errors"
+}
+
+cache_ptrs()
+{
+    # Full identity (dev:bucket:offset + generation), not just an address.
+    # Cache device 0 has durability=0 and never contains the durable data copy.
+    awk '/ptr:.* cached/ {
+        for (i=1; i<=NF; i++)
+            if ($i ~ /^0:[0-9]+:[0-9]+$/ && $(i+1) == "gen")
+                print $i, $(i+2)
+    }' "$1" | sort -u
+}
+
+cache_fixture()
+{
+    local ec=$1 compression=$2 encrypted=$3
+    local opts=() devices=() i
+    [[ $encrypted = yes ]] && opts+=(--encrypted --no_passphrase)
+    for ((i=1; i<${#ktest_scratch_dev[@]}; i++)); do
+        devices+=(--label=hdd.d$i "${ktest_scratch_dev[i]}")
+    done
+    set_watchdog 600
+    run_quiet "" bcachefs format -f --block_size=4k --bucket_size=256k \
+        --data_replicas=2 --metadata_replicas=2 --erasure_code="$ec" \
+        --compression="$compression" "${opts[@]}" \
+        --durability=0 --label=cache "${ktest_scratch_dev[0]}" \
+        --durability=1 "${devices[@]}" \
+        --foreground_target=hdd --background_target=hdd --metadata_target=hdd
+    cache_devs=$(join_by : "${ktest_scratch_dev[@]}")
+    mount -t bcachefs "$cache_devs" /mnt
+    cache_sysfs
+    mkdir -p "$test_output/evidence"
+}
+
+cache_write_data()
+{
+    local file=$1 mib=$2 compression=$3
+    # Compressible but nonzero and different in every 128K region. Zero-filled
+    # pages from a broken promote must never compare equal to the input.
+    python3 - "$file" "$mib" "$compression" <<'PY'
+import os, sys
+with open(sys.argv[1], 'wb') as f:
+    for _ in range(int(sys.argv[2]) * 8):
+        f.write(os.urandom(131072) if sys.argv[3] == 'none'
+                else os.urandom(4096) * 32)
+    f.flush()
+    os.fsync(f.fileno())
+PY
+}
+
+cache_read()
+{
+    local file=$1 mode=$2
+    sync
+    echo 3 > /proc/sys/vm/drop_caches
+    case $mode in
+        buffered) sha256sum "$file" | awk '{print $1}' ;;
+        direct) dd if="$file" bs=128K iflag=direct status=none | sha256sum | awk '{print $1}' ;;
+        partial)
+            # An aligned 4K read inside each larger checksum extent, then a
+            # whole-file hash. Keep readahead off so these really are partial.
+            blockdev --setra 0 "${ktest_scratch_dev[0]}"
+            python3 - "$file" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
+for off in range(4096, os.fstat(fd).st_size, 131072):
+    assert len(os.pread(fd, 4096, off)) == 4096
+os.close(fd)
+PY
+            sha256sum "$file" | awk '{print $1}' ;;
+        *) cache_fail "unknown read mode $mode" ;;
+    esac
+}
+
+cache_finish()
+{
+    timeout -k 5 60 umount /mnt
+    bcachefs fsck -n "${ktest_scratch_dev[@]}"
+    bcachefs_test_end_checks "${ktest_scratch_dev[@]}"
+}
+
+cache_degraded_promote()
+{
+    local compression=$1 encrypted=$2 mode=$3 want pass got i lost
+    cache_fixture 1 "$compression" "$encrypted"
+    cache_write_data /mnt/data 256 "$compression"
+    want=$(sha256sum /mnt/data | awk '{print $1}')
+    timeout -k 5 120 bcachefs reconcile wait /mnt
+    timeout -k 5 60 umount /mnt
+    bcachefs list -b extents "${ktest_scratch_dev[@]}" > "$test_output/evidence/extents-before"
+    grep -q stripe_ptr "$test_output/evidence/extents-before" || cache_fail "no EC extents"
+    # Choose a device from an actual data pointer, not a random parity member.
+    lost=$(awk '/stripe_ptr:/ {ec=1; next} ec && /ptr:/ {
+        for(i=1;i<=NF;i++) if($i ~ /^[1-5]:[0-9]+:[0-9]+$/) {
+            split($i,p,":"); print p[1]; exit
+        }
+    }' "$test_output/evidence/extents-before")
+    [[ $lost =~ ^[1-5]$ ]] || cache_fail "cannot identify an EC data member"
+    if [[ $compression != none ]]; then
+        grep -q "compress $compression" "$test_output/evidence/extents-before" || cache_fail "data was not compressed"
+    fi
+    mount -t bcachefs "$cache_devs" /mnt
+    cache_sysfs
+    echo cache > "$cache_sys/options/promote_target"
+    bcachefs device offline --force "${ktest_scratch_dev[lost]}"
+
+    local trace=/sys/kernel/tracing
+    grep -q '^bch2_ec_read_extent\>' "$trace/available_filter_functions" || \
+        cache_fail "bch2_ec_read_extent is not traceable; reconstruction would be unverified"
+    echo 0 > "$trace/tracing_on"
+    echo bch2_ec_read_extent > "$trace/set_ftrace_filter"
+    echo function > "$trace/current_tracer"
+    echo > "$trace/trace"
+    echo 1 > "$trace/tracing_on"
+    for pass in 1 2; do
+        got=$(cache_read /mnt/data "$mode")
+        [[ $got = "$want" ]] || cache_fail "pass $pass returned wrong data"
+        sync
+        [[ $(cache_errors) = 0 ]] || cache_fail "pass $pass produced cache checksum errors"
+    done
+    echo 0 > "$trace/tracing_on"
+    cat "$trace/trace" > "$test_output/evidence/reconstruct.trace"
+    echo nop > "$trace/current_tracer"
+    echo > "$trace/set_ftrace_filter"
+    grep -q 'bch2_ec_read_extent' "$test_output/evidence/reconstruct.trace" || cache_fail "no reconstruction happened"
+    # Positive control: surviving, readable EC data must really be promoted.
+    for ((i=0;i<50;i++)); do
+        cache_ptrs "$cache_keys" > "$test_output/evidence/promoted-pointers"
+        [[ -s $test_output/evidence/promoted-pointers ]] && break
+        sleep .1
+    done
+    [[ -s $test_output/evidence/promoted-pointers ]] || cache_fail "no healthy data was promoted"
+    bcachefs device online "${ktest_scratch_dev[lost]}"
+    cache_finish
+}
+
+cache_seed_bad_copy()
+{
+    local compression=$1 encrypted=$2 i
+    cache_fixture 0 "$compression" "$encrypted"
+    bcachefs subvolume create /mnt/sv
+    cache_write_data /mnt/sv/data 16 "$compression"
+    cache_want=$(sha256sum /mnt/sv/data | awk '{print $1}')
+    echo cache > "$cache_sys/options/promote_target"
+    for ((i=0;i<10;i++)); do
+        [[ $(cache_read /mnt/sv/data buffered) = "$cache_want" ]] || cache_fail "healthy cache read"
+        sleep .1
+        cache_ptrs "$cache_keys" > "$test_output/evidence/bad-pointers"
+        [[ -s $test_output/evidence/bad-pointers ]] && break
+    done
+    [[ -s $test_output/evidence/bad-pointers ]] || cache_fail "no cache copies to corrupt"
+    [[ $(cache_errors) = 0 ]] || cache_fail "cache was corrupt before injection"
+    # Prevent replacement promotion from masking whether the bad pointer was
+    # removed. Reconciliation is disabled too: only the read repair is tested.
+    echo none > "$cache_sys/options/promote_target"
+    echo 0 > "$cache_sys/options/reconcile_enabled"
+    timeout -k 5 60 umount /mnt
+    bcachefs list -b extents "${ktest_scratch_dev[@]}" > "$test_output/evidence/extents-inject"
+    cache_ptrs "$test_output/evidence/extents-inject" > "$test_output/evidence/bad-pointers"
+    [[ -s $test_output/evidence/bad-pointers ]] || cache_fail "cache disappeared before injection"
+    # Pointer offsets are sectors; every bucket was formatted as 256K (512
+    # sectors). Re-read the authoritative unmounted mapping before writing.
+    awk '{split($1,p,":"); print p[2]*512+p[3]}' "$test_output/evidence/bad-pointers" |
+        bcachefs_corrupt_sectors "${ktest_scratch_dev[0]}"
+    mount -t bcachefs -o promote_target=none,reconcile_enabled=0 "$cache_devs" /mnt
+    cache_sysfs
+}
+
+cache_bad_copy()
+{
+    local mode=$1 compression=$2 encrypted=$3 sharing=${4:-none}
+    local before after got i replacement
+    cache_seed_bad_copy "$compression" "$encrypted"
+    case $sharing in
+        snapshot) bcachefs subvolume snapshot /mnt/sv /mnt/snap ;;
+        reflink) cp --reflink=always /mnt/sv/data /mnt/clone ;;
+    esac
+    before=$(cache_errors)
+    if [[ $sharing = overwrite ]]; then
+        # A stress race, not a deterministic delayed-work interleaving. The
+        # atomic rename permits either complete version, never mixed bytes.
+        cache_write_data /mnt/sv/new 16 "$compression"
+        replacement=$(sha256sum /mnt/sv/new | awk '{print $1}')
+        (sleep .01; mv /mnt/sv/new /mnt/sv/data) &
+    fi
+    got=$(cache_read /mnt/sv/data "$mode")
+    if [[ $sharing = overwrite ]]; then
+        wait
+        [[ $got = "$cache_want" || $got = "$replacement" ]] || cache_fail "mixed overwrite read"
+        cache_want=$replacement
+    else
+        [[ $got = "$cache_want" ]] || cache_fail "fallback returned wrong data"
+    fi
+    after=$(cache_errors)
+    ((after > before)) || cache_fail "injected bad cache was never read"
+    echo "first pass checksum errors: $((after-before))"
+    # The queued drop is asynchronous. Wait for the exact injected identities
+    # to disappear, not an arbitrary sleep or just a successful read.
+    for ((i=0;i<100;i++)); do
+        cache_ptrs "$cache_keys" > "$test_output/evidence/pointers-after"
+        comm -12 "$test_output/evidence/bad-pointers" "$test_output/evidence/pointers-after" > "$test_output/evidence/still-bad"
+        [[ ! -s $test_output/evidence/still-bad ]] && break
+        sleep .1
+    done
+    [[ ! -s $test_output/evidence/still-bad ]] || cache_fail "bad cached pointers remain after confirmed failure"
+    [[ $(cache_read /mnt/sv/data "$mode") = "$cache_want" ]] || cache_fail "second read"
+    case $sharing in
+        snapshot) [[ $(cache_read /mnt/snap/data "$mode") = "$cache_want" ]] || cache_fail "snapshot damaged" ;;
+        reflink) [[ $(cache_read /mnt/clone "$mode") = "$cache_want" ]] || cache_fail "reflink damaged" ;;
+    esac
+    [[ $(cache_errors) = "$after" ]] || cache_fail "second pass still reads bad cache"
+    echo "second pass checksum errors: 0"
+    timeout -k 5 60 umount /mnt
+    mount -t bcachefs -o promote_target=none,reconcile_enabled=0 "$cache_devs" /mnt
+    [[ $(cache_read /mnt/sv/data "$mode") = "$cache_want" ]] || cache_fail "remount data differs"
+    ktest_expect_device_errors=1
+    ktest_expect_sb_errors='data_read_csum_err_recovered'
+    cache_finish
+}
+
+test_ec_promote_degraded() { cache_degraded_promote none no buffered; }
+test_ec_promote_degraded_direct() { cache_degraded_promote none no direct; }
+test_ec_promote_degraded_encrypted() { cache_degraded_promote none yes buffered; }
+test_ec_promote_degraded_lz4_partial() { cache_degraded_promote lz4 no partial; }
+test_ec_promote_degraded_zstd_encrypted_partial() { cache_degraded_promote zstd yes partial; }
+test_bad_cache_buffered() { cache_bad_copy buffered none no; }
+test_bad_cache_direct() { cache_bad_copy direct none no; }
+test_bad_cache_encrypted() { cache_bad_copy buffered none yes; }
+test_bad_cache_lz4_partial() { cache_bad_copy partial lz4 no; }
+test_bad_cache_zstd_encrypted_partial() { cache_bad_copy partial zstd yes; }
+test_bad_cache_snapshot() { cache_bad_copy buffered none no snapshot; }
+test_bad_cache_reflink() { cache_bad_copy direct none no reflink; }
+test_bad_cache_overwrite() { cache_bad_copy buffered none no overwrite; }
+
+main "$@"
