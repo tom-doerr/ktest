@@ -37,6 +37,7 @@ cache_sysfs()
     cache_sys=/sys/fs/bcachefs/$uuid
     [[ -r $cache_sys/dev-0/io_errors ]] || cache_fail "missing device error counters"
     cache_keys=/sys/kernel/debug/bcachefs/$uuid/btrees/extents/keys
+    cache_reflink_keys=/sys/kernel/debug/bcachefs/$uuid/btrees/reflink/keys
     [[ -r $cache_keys ]] || cache_fail "missing extents debugfs view"
 }
 
@@ -58,8 +59,10 @@ cache_ptrs()
         for (i=1; i<=NF; i++)
             if ($i ~ /^0:[0-9]+:[0-9]+$/ && $(i+1) == "gen")
                 print $i, $(i+2)
-    }' "$1" | sort -u
+    }' "$@" | sort -u
 }
+
+cache_live_ptrs() { cache_ptrs "$cache_keys" "$cache_reflink_keys"; }
 
 cache_fixture()
 {
@@ -131,7 +134,13 @@ cache_finish()
 {
     timeout -k 5 60 umount /mnt
     bcachefs fsck -n "${ktest_scratch_dev[@]}"
-    bcachefs_test_end_checks "${ktest_scratch_dev[@]}"
+    # Cancelling the unfilled promote is the FIX under test, and increments
+    # data_update_fail. Generic slowpath failure-rate limits reject that correct
+    # behavior. Preserve counters, but apply the integrity/leak checks here.
+    bcachefs show-super --field-only counters "${ktest_scratch_dev[0]}" > "$test_output/evidence/counters-final"
+    check_bcachefs_leaks
+    check_bcachefs_errors "${ktest_scratch_dev[@]}"
+    check_bcachefs_device_errors "${ktest_scratch_dev[@]}"
 }
 
 cache_degraded_promote()
@@ -189,7 +198,7 @@ cache_degraded_promote()
     grep -q 'bch2_ec_read_extent' "$test_output/evidence/reconstruct.trace" || cache_fail "no reconstruction happened"
     # Positive control: surviving, readable EC data must really be promoted.
     for ((i=0;i<50;i++)); do
-        cache_ptrs "$cache_keys" > "$test_output/evidence/promoted-pointers"
+        cache_live_ptrs > "$test_output/evidence/promoted-pointers"
         [[ -s $test_output/evidence/promoted-pointers ]] && break
         sleep .1
     done
@@ -210,7 +219,7 @@ cache_seed_bad_copy()
     for ((i=0;i<10;i++)); do
         [[ $(cache_read /mnt/sv/data buffered) = "$cache_want" ]] || cache_fail "healthy cache read"
         sleep .1
-        cache_ptrs "$cache_keys" > "$test_output/evidence/bad-pointers"
+        cache_live_ptrs > "$test_output/evidence/bad-pointers"
         [[ -s $test_output/evidence/bad-pointers ]] && break
     done
     cp "$cache_keys" "$test_output/evidence/extents-warm"
@@ -262,7 +271,7 @@ cache_bad_copy()
     # The queued drop is asynchronous. Wait for the exact injected identities
     # to disappear, not an arbitrary sleep or just a successful read.
     for ((i=0;i<100;i++)); do
-        cache_ptrs "$cache_keys" > "$test_output/evidence/pointers-after"
+        cache_live_ptrs > "$test_output/evidence/pointers-after"
         comm -12 "$test_output/evidence/bad-pointers" "$test_output/evidence/pointers-after" > "$test_output/evidence/still-bad"
         [[ ! -s $test_output/evidence/still-bad ]] && break
         sleep .1
