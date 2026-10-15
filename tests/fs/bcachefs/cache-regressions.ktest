@@ -18,6 +18,14 @@ cache_fail()
         [[ ! -r ${cache_keys:-} ]] || cp "$cache_keys" "$test_output/evidence/extents-failure"
         [[ ! -r ${cache_sys:-}/dev-0/io_errors ]] || \
             cp "$cache_sys/dev-0/io_errors" "$test_output/evidence/errors-failure"
+        if [[ -d ${cache_sys:-}/counters ]]; then
+            for f in "$cache_sys"/counters/data_read*; do
+                printf '%s\n' "$f"
+                cat "$f"
+            done > "$test_output/evidence/read-counters-failure"
+            bcachefs fs usage /mnt > "$test_output/evidence/usage-failure"
+            cat /sys/kernel/tracing/trace > "$test_output/evidence/trace-failure"
+        fi
     fi
     exit 1
 }
@@ -72,6 +80,10 @@ cache_fixture()
     mount -t bcachefs "$cache_devs" /mnt
     cache_sysfs
     mkdir -p "$test_output/evidence"
+    if [[ -w /sys/kernel/tracing/events/bcachefs/data_read_nopromote/enable ]]; then
+        echo 1 > /sys/kernel/tracing/events/bcachefs/data_read_nopromote/enable
+        echo 1 > /sys/kernel/tracing/tracing_on
+    fi
 }
 
 cache_write_data()
