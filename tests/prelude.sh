@@ -55,17 +55,21 @@ fi
 # a guard could correctly preserve. Must stay outside the ktest_cpus
 # guard — an inherited ktest_cpus there would skip them and leave
 # config-* appending to unset vars.
-ktest_kernel_append=()
-ktest_kernel_make_append=()
-ktest_images=()
-ktest_rw_images=()
-ktest_scratch_dev=()
-ktest_scratch_dev_sizes=()
-ktest_scratch_dev_count=0
-ktest_make_install=()
-ktest_kernel_config_require=()
-ktest_kernel_config_require_soft=()
-ktest_qemu_append=()
+# Initialize only once: sanitizer overlays re-source this file.
+if [[ -z ${ktest_prelude_arrays_init:-} ]]; then
+    ktest_prelude_arrays_init=1
+    ktest_kernel_append=()
+    ktest_kernel_make_append=()
+    ktest_images=()
+    ktest_rw_images=()
+    ktest_scratch_dev=()
+    ktest_scratch_dev_sizes=()
+    ktest_scratch_dev_count=0
+    ktest_make_install=()
+    ktest_kernel_config_require=()
+    ktest_kernel_config_require_soft=()
+    ktest_qemu_append=()
+fi
 
 case $ktest_storage_bus in
     virtio-blk)

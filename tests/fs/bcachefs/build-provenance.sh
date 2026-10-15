@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 # Loaded by bcachefs-test-libs.sh. Optional strict checks for pinned VM runs.
+if [[ ${ktest_expected_profile:-} = kasan ]]; then
+    require-kernel-append kasan.fault=panic
+fi
+
 init_verify_bcachefs_build()
 {
     [[ -n ${ktest_expected_bcachefs_sha:-} ]] || return 0
