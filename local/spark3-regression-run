@@ -36,6 +36,11 @@ git -C "$source_repo" cat-file -e "$sha^{commit}"
 mkdir -p "${KTEST_RUN_ROOT:-$HOME/ktest-out/regressions}"
 run=$(mktemp -d "${KTEST_RUN_ROOT:-$HOME/ktest-out/regressions}/$(date -u +%Y%m%dT%H%M%SZ)-${sha:0:12}-${profile}.XXXXXX")
 mkdir -p "$run/deps" "$run/output"
+# Existing ktest caches are keyed by commit + config/build flags. Workspaces
+# remain private; reuse only those content-addressed build artifacts.
+for cache in tools-cache dkms-cache; do
+    [[ ! -d $HOME/.ktest/$cache ]] || ln -s "$HOME/.ktest/$cache" "$run/$cache"
+done
 # Own checkout and output: no shared source checkout, kernel build or VM slot.
 git clone -q --no-checkout --shared "$source_repo" "$run/deps/bcachefs-tools"
 git -C "$run/deps/bcachefs-tools" checkout -q --detach "$sha"
