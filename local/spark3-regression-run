@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Isolated, revision-pinned bcachefs regressions. Never run on a production NAS.
+set -euo pipefail
+
+usage() {
+    echo 'usage: spark3-regression-run FULL_BCACHEFS_COMMIT TESTFILE TEST [TEST ...]'
+    echo 'Environment: KTEST_PROFILE=plain|kasan|lockdep (plain), KTEST_CPUS=4'
+    echo 'KTEST_KERNEL_DIR=prebuilt kernel directory (required; no implicit rebuild)'
+    echo 'KTEST_SOURCE_REPO=bcachefs git repository (~/git/bcachefs-tools.git)'
+    echo 'KTEST_RUN_ROOT=output parent (~/ktest-out/regressions)'
+}
+[[ ${1:-} != --help ]] || { usage; exit 0; }
+[[ $# -ge 3 ]] || { usage >&2; exit 2; }
+[[ $(hostname -s) = spark-3 ]] || { echo 'VM tests must run on spark-3' >&2; exit 2; }
+
+sha=$1; testfile=$(realpath -e "$2"); shift 2
+[[ $sha =~ ^[0-9a-f]{40}$ ]] || { echo 'Use a full, immutable commit hash' >&2; exit 2; }
+root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+profile=${KTEST_PROFILE:-plain}
+case $profile in plain|kasan|lockdep) ;; *) echo 'Unknown profile' >&2; exit 2;; esac
+kernel=$(realpath -e "${KTEST_KERNEL_DIR:?Set KTEST_KERNEL_DIR to the kernel to test}")
+[[ -r $kernel/config ]] || { echo 'Prebuilt kernel has no config' >&2; exit 2; }
+[[ -r /dev/kvm && -w /dev/kvm ]] || { echo 'No KVM access on spark-3' >&2; exit 2; }
+[[ -x $testfile && $testfile = "$root/"* ]] || { echo 'Test must belong to this checkout' >&2; exit 2; }
+[[ -z $(git -C "$root" status --porcelain) ]] || { echo 'Commit test/harness changes first' >&2; exit 2; }
+for config in FUNCTION_TRACER DEBUG_FS; do
+    grep -qx "CONFIG_$config=y" "$kernel/config" || { echo "Missing CONFIG_$config" >&2; exit 2; }
+done
+case $profile in
+    kasan) grep -qx CONFIG_KASAN=y "$kernel/config" ;;
+    lockdep) grep -qx CONFIG_PROVE_LOCKING=y "$kernel/config" ;;
+esac
+source_repo=${KTEST_SOURCE_REPO:-$HOME/git/bcachefs-tools.git}
+git -C "$source_repo" cat-file -e "$sha^{commit}"
+
+mkdir -p "${KTEST_RUN_ROOT:-$HOME/ktest-out/regressions}"
+run=$(mktemp -d "${KTEST_RUN_ROOT:-$HOME/ktest-out/regressions}/$(date -u +%Y%m%dT%H%M%SZ)-${sha:0:12}-${profile}.XXXXXX")
+mkdir -p "$run/deps" "$run/output"
+# Existing ktest caches are keyed by commit + config/build flags. Workspaces
+# remain private; reuse only those content-addressed build artifacts.
+for cache in tools-cache dkms-cache; do
+    [[ ! -d $HOME/.ktest/$cache ]] || ln -s "$HOME/.ktest/$cache" "$run/$cache"
+done
+# Own checkout and output: no shared source checkout, kernel build or VM slot.
+git clone -q --no-checkout --shared "$source_repo" "$run/deps/bcachefs-tools"
+git -C "$run/deps/bcachefs-tools" checkout -q --detach "$sha"
+export ktest_deps_dir=$run/deps
+export ktest_cpus=${KTEST_CPUS:-4}
+export ktest_expected_bcachefs_sha=$sha
+export ktest_expected_test_sha=$(git -C "$root" rev-parse HEAD)
+export ktest_expected_profile=$profile
+export ktest_expected_config_sha=$(sha256sum "$kernel/config" | cut -d' ' -f1)
+export PATH=$HOME/.cargo/bin:/usr/lib/llvm-18/bin:$PATH
+export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-1.90.0}
+export LIBCLANG_PATH=${LIBCLANG_PATH:-/usr/lib/llvm-18/lib}
+
+# Unlike parse-test.sh, never silently discard a renamed/missing requested test.
+"$testfile" list-tests > "$run/available-tests"
+for test in "$@"; do
+    grep -qxF "$test" "$run/available-tests" || { echo "Unknown test: $test" >&2; exit 2; }
+done
+{
+    printf 'host=%s\narch=%s\nbcachefs=%s\nktest=%s\nprofile=%s\n' \
+        "$(hostname -s)" "$(uname -m)" "$sha" "$ktest_expected_test_sha" "$profile"
+    printf 'test=%s\n' "$testfile"
+    printf 'selected=%s\n' "$@"
+    sha256sum "$testfile" "$kernel/config" "$kernel/vmlinux"
+    git -C "$root" status --porcelain
+} > "$run/host-manifest.txt"
+cp "$kernel/config" "$run/kernel.config"
+printf 'Run directory: %s\n' "$run"
+
+set +e
+"$root/ktest" run -N 19 -k "$kernel" -o "$run/output" "$testfile" "$@" > "$run/console.log" 2>&1
+rc=$?
+set -e
+printf '%s\n' "$rc" > "$run/harness-exit-status"
+# Require a verified guest manifest and every requested result, even if ktest's
+# global exit code treats NOTRUN as success. A failed/partial run stays visible.
+[[ -s $run/output/provenance/verified ]] || rc=1
+: > "$run/results.txt"
+for test in "$@"; do
+    status=$run/output/out/$(basename "$testfile" .ktest).$test/status
+    if [[ -r $status ]]; then
+        printf '%s: %s\n' "$test" "$(cat "$status")" | tee -a "$run/results.txt"
+        grep -q 'PASSED' "$status" || rc=1
+    else
+        printf '%s: NOT STARTED\n' "$test" | tee -a "$run/results.txt"
+        rc=1
+    fi
+done
+printf '%s\n' "$rc" > "$run/exit-status"
+exit "$rc"
