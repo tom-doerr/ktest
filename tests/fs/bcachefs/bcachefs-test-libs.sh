@@ -5,6 +5,7 @@
 #
 
 . $(dirname $(readlink -e "${BASH_SOURCE[0]}"))/../../test-libs.sh
+. "$(dirname "$(readlink -e "${BASH_SOURCE[0]}")")/build-provenance.sh"
 
 # nodebug test variant: the harness passes ktest_bcachefs_no_debug (it
 # rides testrunner's ktest_* passthrough). Translate it once to the

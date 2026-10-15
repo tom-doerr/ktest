@@ -627,8 +627,11 @@ start_vm()
 	    ktest_ssh_port=$(get_unused_port)
 	    echo $ktest_ssh_port > "$ktest_out/vm/ssh_port"
 
+	    # Local: an explicit device with romfile= (no PXE option ROM), so qemu
+	    # doesn't need ipxe-qemu's efi-virtio.rom - we boot -kernel anyway.
 	    qemu_cmd+=( \
-		-nic    user,model=virtio,hostfwd=tcp:127.0.0.1:$ktest_ssh_port-:22	\
+		-netdev user,id=ktestnet,hostfwd=tcp:127.0.0.1:$ktest_ssh_port-:22	\
+		-device virtio-net-pci,netdev=ktestnet,romfile=			\
 	    )
 	    ;;
 	vde)
@@ -844,10 +847,15 @@ start_vm()
 	local sock="$ktest_out/vm/$1" dir=$2 pid
 
 	rm -f "$sock"
+	# virtiofsd < 1.11 (Ubuntu 24.04 ships 1.10) has no --translate-uid; then
+	# files show up in the guest owned by the host user, not root. Local.
+	local translate=()
+	if virtiofsd --help 2>&1 | grep -q -- --translate-uid; then
+	    translate=(--translate-uid map:0:$(id -u):1 --translate-gid map:0:$(id -g):1)
+	fi
 	virtiofsd	--socket-path="$sock"				\
 			--shared-dir "$dir" --sandbox none		\
-			--translate-uid map:0:$(id -u):1		\
-			--translate-gid map:0:$(id -g):1		\
+			"${translate[@]}"				\
 			>& "$sock.log" &
 	pid=$!
 	while [[ ! -S "$sock" ]]; do
