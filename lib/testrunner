@@ -38,6 +38,12 @@ ln -sf $ktest_out /ktest-out
 # missing tag would then fail the boot mount on every non-nix host, and every
 # existing image would need rebuilding. Here, a host without a store just
 # leaves an empty directory.
+# Older Spark 3 root images link /nix -> /host/nix. Without a host Nix
+# installation that is a dangling symlink, not a directory mkdir can use.
+# The root image is a disposable QEMU snapshot; fix only this boot's view.
+if [[ -L /nix && ! -e /nix ]]; then
+    rm -f /nix
+fi
 mkdir -p /nix/store
 mount -t virtiofs nix /nix/store 2>/dev/null || rmdir /nix/store 2>/dev/null || true
 
