@@ -3,6 +3,7 @@
 # Only ktest scratch devices are formatted/corrupted. Raw writes happen unmounted.
 
 . "$(dirname "$(readlink -e "${BASH_SOURCE[0]}")")/bcachefs-test-libs.sh"
+set -o pipefail
 
 require-kernel-config BCACHEFS_ERASURE_CODING
 require-kernel-config DYNAMIC_FTRACE
@@ -28,7 +29,10 @@ cache_sysfs()
 cache_errors()
 {
     # First section is lifetime; the second is since reset. Do not double count.
-    awk '$1 == "checksum:" { print $2; found=1; exit }
+    awk -F: '$1 ~ /^[[:space:]]*checksum$/ {
+             gsub(/[[:space:]]/, "", $2)
+             if ($2 !~ /^[0-9]+$/) exit 1
+             print $2; found=1; exit }
          END { if (!found) exit 1 }' "$cache_sys/dev-0/io_errors"
 }
 
@@ -135,6 +139,7 @@ cache_degraded_promote()
     mount -t bcachefs "$cache_devs" /mnt
     cache_sysfs
     echo cache > "$cache_sys/options/promote_target"
+    bcachefs set-file-option --promote_target=cache /mnt/data
     bcachefs device offline --force "${ktest_scratch_dev[lost]}"
 
     local trace=/sys/kernel/tracing
@@ -149,6 +154,7 @@ cache_degraded_promote()
         got=$(cache_read /mnt/data "$mode")
         [[ $got = "$want" ]] || cache_fail "pass $pass returned wrong data"
         sync
+        cat "$cache_sys/dev-0/io_errors" > "$test_output/evidence/errors-pass-$pass"
         [[ $(cache_errors) = 0 ]] || cache_fail "pass $pass produced cache checksum errors"
     done
     echo 0 > "$trace/tracing_on"
@@ -175,18 +181,21 @@ cache_seed_bad_copy()
     cache_write_data /mnt/sv/data 16 "$compression"
     cache_want=$(sha256sum /mnt/sv/data | awk '{print $1}')
     echo cache > "$cache_sys/options/promote_target"
+    bcachefs set-file-option --promote_target=cache /mnt/sv/data
     for ((i=0;i<10;i++)); do
         [[ $(cache_read /mnt/sv/data buffered) = "$cache_want" ]] || cache_fail "healthy cache read"
         sleep .1
         cache_ptrs "$cache_keys" > "$test_output/evidence/bad-pointers"
         [[ -s $test_output/evidence/bad-pointers ]] && break
     done
+    cp "$cache_keys" "$test_output/evidence/extents-warm"
     [[ -s $test_output/evidence/bad-pointers ]] || cache_fail "no cache copies to corrupt"
     [[ $(cache_errors) = 0 ]] || cache_fail "cache was corrupt before injection"
     # Prevent replacement promotion from masking whether the bad pointer was
     # removed. Reconciliation is disabled too: only the read repair is tested.
-    echo none > "$cache_sys/options/promote_target"
     echo 0 > "$cache_sys/options/reconcile_enabled"
+    echo none > "$cache_sys/options/promote_target"
+    bcachefs set-file-option --promote_target=none /mnt/sv/data
     timeout -k 5 60 umount /mnt
     bcachefs list -b extents "${ktest_scratch_dev[@]}" > "$test_output/evidence/extents-inject"
     cache_ptrs "$test_output/evidence/extents-inject" > "$test_output/evidence/bad-pointers"
