@@ -71,7 +71,8 @@ cp "$kernel/config" "$run/kernel.config"
 printf 'Run directory: %s\n' "$run"
 
 set +e
-"$root/ktest" run -N 19 -k "$kernel" -o "$run/output" "$testfile" "$@" > "$run/console.log" 2>&1
+timeout -k 15 "${KTEST_RUN_TIMEOUT:-3600}" \
+    "$root/ktest" run -N 19 -k "$kernel" -o "$run/output" "$testfile" "$@" > "$run/console.log" 2>&1
 rc=$?
 set -e
 printf '%s\n' "$rc" > "$run/harness-exit-status"
