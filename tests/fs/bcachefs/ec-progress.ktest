@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# Progress and integrity tests; workload completion is bounded independently
+# from ktest's VM watchdog. No production devices or host drop_caches calls.
+. "$(dirname "$(readlink -e "${BASH_SOURCE[0]}")")/bcachefs-test-libs.sh"
+require-kernel-config BCACHEFS_ERASURE_CODING
+for ((i=0;i<5;i++)); do config-scratch-devs 2G; done
+
+progress_fail() { echo "progress regression: $*" >&2; exit 1; }
+progress_mount()
+{
+    progress_devs=$(join_by : "${ktest_scratch_dev[@]}")
+    mount -t bcachefs "$progress_devs" /mnt
+    local uuid
+    uuid=$(bcachefs fs usage /mnt | awk '/^Filesystem:/ {print $2; exit}')
+    progress_sys=/sys/fs/bcachefs/$uuid
+    progress_debug=/sys/kernel/debug/bcachefs/$uuid
+    [[ -r $progress_sys/internal/journal_debug ]] || progress_fail "missing journal diagnostics"
+    mkdir -p "$test_output/evidence"
+    local d
+    for d in "$progress_sys"/dev-*; do echo 0 > "$d/discard"; done
+}
+
+progress_ctr()
+{
+    awk '/since mount/ {print $3; found=1}
+         END {if (!found) exit 1}' "$progress_sys/counters/$1"
+}
+
+progress_buckets()
+{
+    awk -v row="$1" '$1 == row {sum += $2; n++}
+        END {if (!n) exit 1; print sum}' "$progress_sys"/dev-*/alloc_debug
+}
+
+progress_finish()
+{
+    timeout -k 5 60 umount /mnt
+    bcachefs fsck -n "${ktest_scratch_dev[@]}"
+    mount -t bcachefs "$progress_devs" /mnt
+    (cd /mnt; sha256sum -c "$test_output/evidence/survivors.sha256")
+    timeout -k 5 60 umount /mnt
+    bcachefs_test_end_checks "${ktest_scratch_dev[@]}"
+}
+
+progress_stripes()
+{
+    python3 - "$progress_debug/btrees/stripes/keys" "$1" <<'PY'
+import json, re, sys
+text = open(sys.argv[1]).read()
+total = sparse_full = healthy = 0
+for m in re.finditer(r'algo \d+ sectors (\d+) blocks (\d+):(\d+)[^\n]*\n((?:[ \t]+[^\n]*\n?)*)', text):
+    sectors, data = int(m[1]), int(m[2])
+    counts = [int(x) for x in re.findall(r'#(\d+)', m[4])][:data]
+    if len(counts) != data:
+        raise SystemExit('could not parse stripe block counts')
+    total += 1
+    live = [n for n in counts if n]
+    sparse_full += bool(live) and len(live) < data and all(n == sectors for n in live)
+    healthy += len(live) == data and all(n == sectors for n in live)
+print(json.dumps(dict(total=total, sparse_full=sparse_full, healthy=healthy)), file=sys.stderr)
+print(dict(total=total, sparse_full=sparse_full, healthy=healthy)[sys.argv[2]])
+PY
+}
+
+test_ec_sparse_full_bucket_reclaim()
+{
+    set_watchdog 900
+    run_quiet "" bcachefs format -f --fs_size=512M --bucket_size=256k \
+        --erasure_code --replicas=2 "${ktest_scratch_dev[@]}"
+    progress_mount
+    mkdir /mnt/ec /mnt/plain
+    bcachefs set-file-option --erasure_code=0 /mnt/plain
+    # Keep copygc off until the sparse/full layout is captured. Otherwise an
+    # early GC pass could erase the state whose eligibility we are testing.
+    echo 0 > "$progress_sys/options/copygc_enabled"
+    timeout -k 5 180 python3 - <<'PY'
+import os
+buf = os.urandom(262144)
+i = 0
+while True:
+    s = os.statvfs('/mnt')
+    if 100 * (s.f_blocks-s.f_bfree) >= 75 * s.f_blocks:
+        break
+    if i >= 4000:
+        raise SystemExit('fill target never reached')
+    for name, blocks in [('a', 3), ('b', 1)]:
+        with open(f'/mnt/ec/{name}{i:05}', 'wb') as f:
+            for _ in range(blocks): f.write(buf)
+    i += 1
+os.sync()
+print(f'created {i} bucket-aligned pairs')
+PY
+    timeout -k 5 120 bcachefs reconcile wait /mnt
+    (cd /mnt; sha256sum ec/b*) > "$test_output/evidence/survivors.sha256"
+    rm /mnt/ec/a*
+    sync
+    sleep 2
+    cp "$progress_debug/btrees/stripes/keys" "$test_output/evidence/stripes-before"
+    local sparse before after moved i
+    sparse=$(progress_stripes sparse_full)
+    ((sparse > 0)) || progress_fail "no sparse stripes with full live blocks; setup did not hit #1081"
+    before=$(progress_buckets stripe)
+    moved=$(progress_ctr evacuate_bucket)
+    echo 0 > "$progress_sys/options/reconcile_enabled"
+    echo 1 > "$progress_sys/options/copygc_enabled"
+    # Replicated writes consume free buckets without themselves making new
+    # stripes. Slow rotating writes keep copygc's IO clock moving.
+    for ((i=0;i<160;i++)); do
+        if ! timeout -k 5 15 dd if=/dev/zero of=/mnt/plain/fill$i bs=1M count=8 conv=fsync status=none; then
+            # ENOSPC is expected under pressure; timeout is not a pass. The
+            # reclaim assertion below still has to succeed.
+            break
+        fi
+        (( $(progress_buckets free) * 100 < $(progress_buckets capacity) * 15 )) && break
+    done
+    for ((i=0;i<60;i++)); do
+        after=$(progress_buckets stripe)
+        ((after < before && $(progress_ctr evacuate_bucket) > moved)) && break
+        timeout -k 5 10 dd if=/dev/zero of=/mnt/plain/clock bs=1M count=1 conv=fsync status=none || true
+        rm -f /mnt/plain/clock
+        sleep 1
+    done
+    cp "$progress_debug/btrees/stripes/keys" "$test_output/evidence/stripes-after"
+    echo "stripe buckets $before -> $after; sparse-full stripes $sparse; evacuations $moved -> $(progress_ctr evacuate_bucket)"
+    ((after < before)) || progress_fail "no stripe buckets reclaimed"
+    (($(progress_ctr evacuate_bucket) > moved)) || progress_fail "copygc never ran"
+    # Stop pressure: no sustained evacuation of already healthy stripes.
+    rm -f /mnt/plain/*
+    sync
+    sleep 3
+    moved=$(progress_ctr evacuate_bucket)
+    sleep 5
+    (( $(progress_ctr evacuate_bucket) - moved < 1000 )) || progress_fail "copygc keeps evacuating while idle"
+    progress_finish
+}
+
+progress_delete_storm()
+{
+    local size=$1 d sampler
+    set_watchdog 600
+    run_quiet "" bcachefs format -f --bucket_size=256k --btree_node_size=32k \
+        --replicas=2 "${ktest_scratch_dev[@]}"
+    progress_mount
+    for d in "${ktest_scratch_dev[@]}"; do
+        bcachefs device resize-journal "$d" "$size"
+    done
+    cat "$progress_sys/internal/journal_debug" > "$test_output/evidence/journal-before"
+    dd if=/dev/urandom of=/mnt/survivor bs=1M count=16 conv=fsync status=none
+    (cd /mnt; sha256sum survivor) > "$test_output/evidence/survivors.sha256"
+    (
+        while sleep 1; do
+            date -u +%s
+            cat "$progress_sys/internal/journal_debug"
+        done
+    ) > "$test_output/evidence/journal-samples" &
+    sampler=$!
+    # Each worker logs forward progress. Only ENOSPC is expected; RO/EIO and
+    # failure to finish before the external deadline are test failures.
+    timeout -k 5 180 python3 - "$test_output/evidence/delete-progress.json" <<'PY'
+import concurrent.futures, errno, json, os, shutil, sys, time
+def worker(n):
+    data = os.urandom(4096)
+    path = f'/mnt/w{n}'
+    os.mkdir(path)
+    written = deleted = enospc = 0
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        for i in range(1500):
+            try:
+                with open(f'{path}/{i}', 'wb') as f: f.write(data)
+                written += 1
+            except OSError as e:
+                if e.errno != errno.ENOSPC: raise
+                enospc += 1
+                break
+        for name in os.listdir(path):
+            os.unlink(f'{path}/{name}')
+            deleted += 1
+        fd = os.open(path, os.O_DIRECTORY)
+        os.fsync(fd)
+        os.close(fd)
+    assert written >= 1500 and deleted >= 1500, (n, written, deleted)
+    return dict(worker=n, written=written, deleted=deleted, enospc=enospc)
+with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+    result = list(pool.map(worker, range(4)))
+with open(sys.argv[1], 'w') as f: json.dump(result, f, indent=2)
+print(json.dumps(result))
+PY
+    kill "$sampler"
+    wait "$sampler" || true
+    cat "$progress_sys/internal/journal_debug" > "$test_output/evidence/journal-after"
+    # Surviving fsync'd data must survive shutdown/recovery. Emergency RO is
+    # a failure, not a successful way to avoid a hung workload.
+    touch /mnt/still-writable
+    progress_finish
+}
+
+test_delete_storm_journal_16m() { progress_delete_storm 16M; }
+test_delete_storm_journal_512m() { progress_delete_storm 512M; }
+
+main "$@"
