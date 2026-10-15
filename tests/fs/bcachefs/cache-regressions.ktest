@@ -13,6 +13,12 @@ for ((i = 0; i < 5; i++)); do config-scratch-devs 2G; done
 cache_fail()
 {
     echo "cache regression: $*" >&2
+    if [[ -n ${test_output:-} && -d $test_output/evidence ]]; then
+        dmesg > "$test_output/evidence/dmesg-failure"
+        [[ ! -r ${cache_keys:-} ]] || cp "$cache_keys" "$test_output/evidence/extents-failure"
+        [[ ! -r ${cache_sys:-}/dev-0/io_errors ]] || \
+            cp "$cache_sys/dev-0/io_errors" "$test_output/evidence/errors-failure"
+    fi
     exit 1
 }
 
@@ -122,7 +128,14 @@ cache_degraded_promote()
     cache_fixture 1 "$compression" "$encrypted"
     cache_write_data /mnt/data 256 "$compression"
     want=$(sha256sum /mnt/data | awk '{print $1}')
-    timeout -k 5 120 bcachefs reconcile wait /mnt
+    # A compressed tail may stay below reconcile's IO-clock wake threshold.
+    # Require actual EC extents, rather than waiting for unrelated pending work.
+    for ((i=0;i<100;i++)); do
+        cp "$cache_keys" "$test_output/evidence/extents-forming"
+        grep -q stripe_ptr "$test_output/evidence/extents-forming" && break
+        sleep .1
+    done
+    grep -q stripe_ptr "$test_output/evidence/extents-forming" || cache_fail "no EC data formed"
     timeout -k 5 60 umount /mnt
     bcachefs list -b extents "${ktest_scratch_dev[@]}" > "$test_output/evidence/extents-before"
     grep -q stripe_ptr "$test_output/evidence/extents-before" || cache_fail "no EC extents"
@@ -219,19 +232,17 @@ cache_bad_copy()
     esac
     before=$(cache_errors)
     if [[ $sharing = overwrite ]]; then
-        # A stress race, not a deterministic delayed-work interleaving. The
-        # atomic rename permits either complete version, never mixed bytes.
+        # Prepared before the bad read, then copied over the SAME inode as soon
+        # as read completion queues cleanup. This is a stress test, not a
+        # deterministic delayed-work interleaving.
         cache_write_data /mnt/sv/new 16 "$compression"
         replacement=$(sha256sum /mnt/sv/new | awk '{print $1}')
-        (sleep .01; mv /mnt/sv/new /mnt/sv/data) &
     fi
     got=$(cache_read /mnt/sv/data "$mode")
+    [[ $got = "$cache_want" ]] || cache_fail "fallback returned wrong data"
     if [[ $sharing = overwrite ]]; then
-        wait
-        [[ $got = "$cache_want" || $got = "$replacement" ]] || cache_fail "mixed overwrite read"
+        dd if=/mnt/sv/new of=/mnt/sv/data bs=128K iflag=direct oflag=direct conv=notrunc,fsync status=none
         cache_want=$replacement
-    else
-        [[ $got = "$cache_want" ]] || cache_fail "fallback returned wrong data"
     fi
     after=$(cache_errors)
     ((after > before)) || cache_fail "injected bad cache was never read"
@@ -255,6 +266,10 @@ cache_bad_copy()
     timeout -k 5 60 umount /mnt
     mount -t bcachefs -o promote_target=none,reconcile_enabled=0 "$cache_devs" /mnt
     [[ $(cache_read /mnt/sv/data "$mode") = "$cache_want" ]] || cache_fail "remount data differs"
+    case $sharing in
+        snapshot) [[ $(cache_read /mnt/snap/data "$mode") = "$cache_want" ]] || cache_fail "remount snapshot damaged" ;;
+        reflink) [[ $(cache_read /mnt/clone "$mode") = "$cache_want" ]] || cache_fail "remount reflink damaged" ;;
+    esac
     ktest_expect_device_errors=1
     ktest_expect_sb_errors='data_read_csum_err_recovered'
     cache_finish
